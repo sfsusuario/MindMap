@@ -92,6 +92,28 @@
       text-align: right;
       line-height: 1.8;
     }
+
+    /* Hover tooltip – full label text */
+    #tooltip {
+      position: fixed;
+      pointer-events: none;
+      background: rgba(12, 16, 32, 0.95);
+      color: rgba(255,255,255,0.92);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 12.5px;
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.13);
+      max-width: 280px;
+      line-height: 1.55;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.65);
+      visibility: hidden;
+      opacity: 0;
+      transition: opacity 0.15s;
+      z-index: 100;
+      word-break: break-word;
+    }
+    #tooltip.show { visibility: visible; opacity: 1; }
   </style>
 </head>
 <body>
@@ -102,6 +124,7 @@
     Drag &nbsp;·&nbsp; reposicionar nodo<br>
     Scroll &nbsp;·&nbsp; zoom &nbsp;&nbsp; Doble click &nbsp;·&nbsp; centrar
   </div>
+  <div id="tooltip"></div>
 
   <script>
   (() => {
@@ -246,6 +269,24 @@
       return s.length <= max ? s : s.slice(0, max - 1) + '…';
     }
 
+    function wrapLabel(text, maxCh, maxLines) {
+      const words = text.split(' ');
+      const lines = [];
+      let cur = '';
+      for (const w of words) {
+        const next = cur ? cur + ' ' + w : w;
+        if (cur && next.length > maxCh) {
+          lines.push(cur);
+          if (lines.length >= maxLines) return lines;
+          cur = w;
+        } else {
+          cur = next;
+        }
+      }
+      if (cur && lines.length < maxLines) lines.push(cur);
+      return lines.length ? lines : [text.slice(0, maxCh)];
+    }
+
     // ── D3 Force Simulation ───────────────────────────────────────────────────
     function buildSim() {
       const REPULSION = [-520, -310, -180, -100, -60];
@@ -261,7 +302,7 @@
         .force('charge', d3.forceManyBody()
           .strength(d => REPULSION[Math.min(d.depth, 4)]))
         .force('collide', d3.forceCollide()
-          .radius(d => d.r + (d.depth >= 3 ? 22 : 14))  // extra room for sub-text
+          .radius(d => d.r + (d.depth >= 3 ? 32 : 14))  // extra room for multi-line sub-text
           .strength(0.88))
         .force('center', d3.forceCenter(0, 0))
         .alphaDecay(0.018)
@@ -348,38 +389,47 @@
               .style('opacity', 0)
               .transition().delay(350).duration(200).style('opacity', 0.85);
 
-            // Tooltip with full label text
-            g.append('title').text(d => d.label);
+            // Hover tooltip – always shows the complete label
+            const tip = document.getElementById('tooltip');
+            g.on('mouseenter.tip', (ev, d) => {
+                tip.textContent = d.label;
+                tip.classList.add('show');
+              })
+              .on('mousemove.tip', ev => {
+                const x = ev.clientX + 14, y = ev.clientY - 10;
+                const ow = tip.offsetWidth  || 200;
+                const oh = tip.offsetHeight || 40;
+                tip.style.left = Math.min(x, window.innerWidth  - ow - 8) + 'px';
+                tip.style.top  = Math.min(y, window.innerHeight - oh - 8) + 'px';
+              })
+              .on('mouseleave.tip', () => tip.classList.remove('show'));
 
-            // Labels
+            // Labels – word-wrap instead of hard truncation
             g.each(function(d) {
-              const el = d3.select(this);
-              const fs  = FS[Math.min(d.depth, 4)];
-              const lbl = trunc(d.label, MAX_CH[Math.min(d.depth, 4)]);
+              const el    = d3.select(this);
+              const depth = Math.min(d.depth, 4);
+              const fs    = FS[depth];
 
               if (d.depth >= 3) {
-                // Small nodes: label sits below the circle
-                el.append('text')
-                  .attr('text-anchor', 'middle')
-                  .attr('dominant-baseline', 'hanging')
-                  .attr('y', d.r + 4)
-                  .attr('font-size', fs + 'px')
-                  .style('opacity', 0)
-                  .text(lbl)
-                  .transition().delay(260).duration(300).style('opacity', 1);
+                // Small nodes: up to 3 wrapped lines below the circle
+                const lines = wrapLabel(d.label, 22, 3);
+                const lh    = fs + 2;
+                lines.forEach((line, i) => {
+                  el.append('text')
+                    .attr('text-anchor', 'middle')
+                    .attr('dominant-baseline', 'hanging')
+                    .attr('y', d.r + 5 + i * lh)
+                    .attr('font-size', fs + 'px')
+                    .style('opacity', 0)
+                    .text(line)
+                    .transition().delay(260).duration(300).style('opacity', 1);
+                });
               } else {
-                // Large / medium nodes: 1-2 lines inside the circle
-                const lh    = fs * 1.32;
-                const words = lbl.split(' ');
-                let lines;
-                if (words.length <= 1) {
-                  lines = [lbl];
-                } else {
-                  const mid = Math.ceil(words.length / 2);
-                  const l1  = words.slice(0, mid).join(' ');
-                  const l2  = words.slice(mid).join(' ');
-                  lines = l2.trim() ? [l1, l2] : [l1];
-                }
+                // Larger nodes (depth 0-2): up to 3 wrapped lines inside the circle
+                // maxCh tuned to each radius: root=72 → ~20ch, H2=52 → 14ch, H3=38 → 13ch
+                const maxCh = [20, 14, 13][d.depth] ?? 13;
+                const lines  = wrapLabel(d.label, maxCh, 3);
+                const lh     = fs * 1.3;
                 const startY = -(lines.length - 1) * lh / 2;
                 lines.forEach((line, i) => {
                   el.append('text')

@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CS Mind Map</title>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: radial-gradient(ellipse at 50% 40%, #1a1f35 0%, #080b14 100%);
+      overflow: hidden;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+    }
+
+    #mindmap { width: 100vw; height: 100vh; display: block; }
+
+    .link { fill: none; stroke-linecap: round; }
+
+    /* Bubbles */
+    .bubble {
+      stroke: rgba(255,255,255,0.22);
+      stroke-width: 1.5px;
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    /* Staggered breathing per depth so bubbles don't all pulse together */
+    .bubble.d0 { animation: breathe 4.2s ease-in-out infinite; filter: drop-shadow(0 0 14px rgba(79,134,198,0.55)); }
+    .bubble.d1 { animation: breathe 5.8s ease-in-out infinite; animation-delay: -0.8s; }
+    .bubble.d2 { animation: breathe 7.1s ease-in-out infinite; animation-delay: -2.1s; }
+    .bubble.d3 { animation: breathe 8.6s ease-in-out infinite; animation-delay: -3.4s; }
+    .bubble.d4 { animation: breathe 10s  ease-in-out infinite; animation-delay: -5s; }
+
+    @keyframes breathe {
+      0%, 100% { transform: scale(1);     }
+      50%       { transform: scale(1.07); }
+    }
+
+    .node { cursor: pointer; }
+    .node.leaf { cursor: default; }
+
+    .node:hover .bubble {
+      stroke: rgba(255,255,255,0.75);
+      stroke-width: 2.5px;
+    }
+
+    .node text {
+      pointer-events: none;
+      user-select: none;
+      fill: rgba(255,255,255,0.93);
+      font-weight: 500;
+      letter-spacing: 0.01em;
+    }
+
+    .expand-dot { fill: rgba(255,255,255,0.8); }
+
+    /* Legend */
+    #legend {
+      position: fixed;
+      bottom: 1.5rem;
+      left: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      pointer-events: none;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.6);
+    }
+    .legend-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: 0 0 6px currentColor;
+    }
+
+    /* Hint */
+    #hint {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      font-size: 11px;
+      color: rgba(255,255,255,0.25);
+      pointer-events: none;
+      letter-spacing: 0.04em;
+      text-align: right;
+      line-height: 1.8;
+    }
+  </style>
+</head>
+<body>
+  <svg id="mindmap"></svg>
+  <div id="legend"></div>
+  <div id="hint">
+    Click &nbsp;·&nbsp; expandir / colapsar<br>
+    Drag &nbsp;·&nbsp; reposicionar nodo<br>
+    Scroll &nbsp;·&nbsp; zoom &nbsp;&nbsp; Doble click &nbsp;·&nbsp; centrar
+  </div>
+
+  <script>
+  (() => {
+    // ── Config ────────────────────────────────────────────────────────────────
+    const COLORS     = ['#4F86C6', '#E07B54', '#5BAD72', '#A06BC0'];
+    const SEC_NAMES  = ['Arquitectura', 'Bases de Datos', 'Vue.js', '.NET / C#'];
+
+    // Visual sizes per depth (0=root, 1=H2, 2=H3, 3=bullet, 4=sub-bullet)
+    const RADII    = [72, 52, 38, 24, 16];
+    const FS       = [13, 12, 10, 8, 7];    // font-size px
+    const MAX_CH   = [30, 22, 22, 18, 13];  // max label chars before truncation
+
+    // ── State ────────────────────────────────────────────────────────────────
+    const allNodes = new Map();   // id → node object (permanent registry)
+    const allLinks = new Map();   // key → link object (permanent registry)
+    let simNodes = [], simLinks = [];
+    let simulation;
+    let rootId;
+
+    // ── SVG / Zoom setup ─────────────────────────────────────────────────────
+    const W = window.innerWidth, H = window.innerHeight;
+    const svg = d3.select('#mindmap').attr('width', W).attr('height', H);
+
+    // container must exist before zoom handler is invoked
+    const container = svg.append('g').attr('class', 'canvas');
+    const gL = container.append('g');  // links drawn below nodes
+    const gN = container.append('g');  // nodes
+
+    const zoom = d3.zoom()
+      .scaleExtent([0.07, 10])
+      .on('zoom', e => container.attr('transform', e.transform));
+
+    svg.call(zoom).call(zoom.transform, d3.zoomIdentity.translate(W / 2, H / 2));
+
+    // Double-click SVG background → reset view
+    svg.on('dblclick.zoom', () =>
+      svg.transition().duration(650)
+         .call(zoom.transform, d3.zoomIdentity.translate(W / 2, H / 2))
+    );
+
+    let lSel = gL.selectAll('line');
+    let nSel = gN.selectAll('g.node');
+
+    // ── Drag (reposition individual nodes) ───────────────────────────────────
+    const drag = d3.drag()
+      .on('start', (e, d) => {
+        e.sourceEvent.stopPropagation();  // don't pan while dragging a node
+        if (!e.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+        d._moved = false;
+      })
+      .on('drag', (e, d) => {
+        d.fx = e.x; d.fy = e.y;
+        d._moved = true;
+      })
+      .on('end', (e, d) => {
+        if (!e.active) simulation.alphaTarget(0);
+        // Unpin after drag (let simulation take over again), except root
+        if (d.id !== rootId) { d.fx = null; d.fy = null; }
+      });
+
+    // ── Markdown Parser ───────────────────────────────────────────────────────
+    function parse(md) {
+      let counter = 0;
+
+      function node(label, depth, parentId, sec) {
+        const id = 'n' + counter++;
+        const n = {
+          id, label, depth, parentId,
+          sectionIndex: sec,
+          children: [],
+          isExpanded: false,
+          r: RADII[Math.min(depth, 4)],
+          _moved: false,
+        };
+        allNodes.set(id, n);
+        if (parentId != null) {
+          allNodes.get(parentId).children.push(id);
+          const k = parentId + '~' + id;
+          allLinks.set(k, { id: k, source: parentId, target: id, depth });
+        }
+        return id;
+      }
+
+      rootId = node('CS Apuntes', 0, null, -1);
+      let h2Id = null, h3Id = null, lastB0Id = null, sec = -1;
+
+      for (const raw of md.split('\n')) {
+        const t = raw.trim();
+        if (!t || t === '---') { lastB0Id = null; continue; }
+
+        const hm = t.match(/^(#{1,3}) (.*)/);
+        if (hm) {
+          const lv = hm[1].length;
+          const lbl = clean(hm[2]);
+          if (lv === 2) {
+            sec++;
+            h2Id = node(shortH2(lbl), 1, rootId, sec);
+            h3Id = null; lastB0Id = null;
+          } else if (lv === 3) {
+            h3Id = node(lbl, 2, h2Id ?? rootId, sec);
+            lastB0Id = null;
+          }
+          continue;
+        }
+
+        // Bullet: `^( *)\* (.*)` — indent=0 is direct child of H3; indent>0 is sub-bullet
+        const bm = raw.match(/^( *)\* (.*)/);
+        if (!bm) continue;
+        const indent = bm[1].length;
+        const lbl    = clean(bm[2]);
+
+        if (indent === 0) {
+          lastB0Id = node(lbl, 3, h3Id ?? h2Id ?? rootId, sec);
+        } else {
+          node(lbl, 4, lastB0Id ?? h3Id ?? h2Id ?? rootId, sec);
+        }
+      }
+    }
+
+    function clean(s) {
+      return s
+        .replace(/\$\\rightarrow\$/g, '→')
+        .replace(/\$[^$]+\$/g, '')
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        .replace(/\*(.*?)\*/g, '$1')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/^\d+\.\s+/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function shortH2(s) {
+      if (/arquitectura/i.test(s))          return 'Arquitectura';
+      if (/datos|sql/i.test(s))             return 'Bases de Datos';
+      if (/vue/i.test(s))                   return 'Vue.js';
+      if (/net|c#|fundamentos/i.test(s))    return '.NET / C#';
+      return trunc(s, 14);
+    }
+
+    function trunc(s, max) {
+      return s.length <= max ? s : s.slice(0, max - 1) + '…';
+    }
+
+    // ── D3 Force Simulation ───────────────────────────────────────────────────
+    function buildSim() {
+      const REPULSION = [-520, -310, -180, -100, -60];
+
+      simulation = d3.forceSimulation(simNodes)
+        .force('link', d3.forceLink(simLinks)
+          .id(d => d.id)
+          .distance(lk => {
+            const s = res(lk.source), t = res(lk.target);
+            return (s ? s.r : 50) + (t ? t.r : 35) + 30;
+          })
+          .strength(0.52))
+        .force('charge', d3.forceManyBody()
+          .strength(d => REPULSION[Math.min(d.depth, 4)]))
+        .force('collide', d3.forceCollide()
+          .radius(d => d.r + (d.depth >= 3 ? 22 : 14))  // extra room for sub-text
+          .strength(0.88))
+        .force('center', d3.forceCenter(0, 0))
+        .alphaDecay(0.018)
+        .on('tick', tick);
+    }
+
+    function restartSim() {
+      simulation.nodes(simNodes);
+      simulation.force('link').links(simLinks);
+      simulation.alpha(0.45).restart();
+    }
+
+    // resolve: forceLink converts string IDs to node objects after first tick
+    function res(x) {
+      return typeof x === 'string' ? allNodes.get(x) : x;
+    }
+
+    // ── Tick: update positions ────────────────────────────────────────────────
+    function tick() {
+      lSel
+        .attr('x1', d => res(d.source)?.x ?? 0)
+        .attr('y1', d => res(d.source)?.y ?? 0)
+        .attr('x2', d => res(d.target)?.x ?? 0)
+        .attr('y2', d => res(d.target)?.y ?? 0);
+      nSel.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+    }
+
+    // ── Color helpers ─────────────────────────────────────────────────────────
+    function nodeColor(d) {
+      if (d.depth === 0) return '#1b2a3d';
+      const base = COLORS[d.sectionIndex] ?? '#888';
+      return d3.color(base).darker(d.depth * 0.3).toString();
+    }
+
+    function linkColor(d) {
+      const t = res(d.target);
+      return COLORS[t?.sectionIndex ?? 0] ?? '#555';
+    }
+
+    // ── Render (D3 data join) ─────────────────────────────────────────────────
+    function render() {
+      // ---- Links ----
+      lSel = gL.selectAll('line').data(simLinks, d => d.id)
+        .join(
+          e => e.append('line')
+                 .attr('class', 'link')
+                 .attr('stroke', linkColor)
+                 .attr('stroke-width', d => [2.8, 1.8, 1.2, 0.7][Math.min(d.depth - 1, 3)])
+                 .attr('stroke-opacity', 0)
+                 .call(l => l.transition().duration(450).attr('stroke-opacity', 0.4)),
+          u => u,
+          x => x.transition().duration(300).attr('stroke-opacity', 0).remove()
+        );
+
+      // ---- Nodes ----
+      nSel = gN.selectAll('g.node').data(simNodes, d => d.id)
+        .join(
+          // ENTER: new nodes pop out from their parent's position
+          e => {
+            const g = e.append('g')
+              .attr('class', d => `node${d.children.length === 0 ? ' leaf' : ''}`)
+              .attr('transform', d => {
+                const p = d.parentId ? allNodes.get(d.parentId) : d;
+                return `translate(${p.x ?? 0},${p.y ?? 0})`;
+              })
+              .call(drag)
+              .on('click', handleClick);
+
+            // Main circle — animates from r=0 with spring overshoot
+            g.append('circle')
+              .attr('class', d => `bubble d${Math.min(d.depth, 4)}`)
+              .attr('r', 0)
+              .attr('fill', nodeColor)
+              .transition().duration(500).ease(d3.easeBackOut.overshoot(1.5))
+              .attr('r', d => d.r);
+
+            // Small dot indicator for expandable nodes
+            g.filter(d => d.children.length > 0)
+              .append('circle')
+              .attr('class', 'expand-dot')
+              .attr('r', 3.5)
+              .attr('cx', d => d.r - 6)
+              .attr('cy', d => -(d.r - 6))
+              .style('opacity', 0)
+              .transition().delay(350).duration(200).style('opacity', 0.85);
+
+            // Tooltip with full label text
+            g.append('title').text(d => d.label);
+
+            // Labels
+            g.each(function(d) {
+              const el = d3.select(this);
+              const fs  = FS[Math.min(d.depth, 4)];
+              const lbl = trunc(d.label, MAX_CH[Math.min(d.depth, 4)]);
+
+              if (d.depth >= 3) {
+                // Small nodes: label sits below the circle
+                el.append('text')
+                  .attr('text-anchor', 'middle')
+                  .attr('dominant-baseline', 'hanging')
+                  .attr('y', d.r + 4)
+                  .attr('font-size', fs + 'px')
+                  .style('opacity', 0)
+                  .text(lbl)
+                  .transition().delay(260).duration(300).style('opacity', 1);
+              } else {
+                // Large / medium nodes: 1-2 lines inside the circle
+                const lh    = fs * 1.32;
+                const words = lbl.split(' ');
+                let lines;
+                if (words.length <= 1) {
+                  lines = [lbl];
+                } else {
+                  const mid = Math.ceil(words.length / 2);
+                  const l1  = words.slice(0, mid).join(' ');
+                  const l2  = words.slice(mid).join(' ');
+                  lines = l2.trim() ? [l1, l2] : [l1];
+                }
+                const startY = -(lines.length - 1) * lh / 2;
+                lines.forEach((line, i) => {
+                  el.append('text')
+                    .attr('text-anchor', 'middle')
+                    .attr('dominant-baseline', 'central')
+                    .attr('y', startY + i * lh)
+                    .attr('font-size', fs + 'px')
+                    .style('opacity', 0)
+                    .text(line)
+                    .transition().delay(260).duration(300).style('opacity', 1);
+                });
+              }
+            });
+
+            return g;
+          },
+
+          // UPDATE: positions are handled by tick(), nothing extra needed
+          u => u,
+
+          // EXIT: shrink circle then remove group
+          x => {
+            x.select('.bubble').transition().duration(320).attr('r', 0);
+            x.selectAll('text').transition().duration(220).style('opacity', 0);
+            x.transition().delay(340).remove();
+          }
+        );
+    }
+
+    // ── Expand / Collapse ─────────────────────────────────────────────────────
+    function handleClick(event, d) {
+      event.stopPropagation();
+      if (d._moved) { d._moved = false; return; }  // was a drag, not a click
+      if (d.children.length === 0) return;          // leaf node
+      d.isExpanded ? collapse(d) : expand(d);
+    }
+
+    function expand(node) {
+      node.isExpanded = true;
+      node.children.forEach(cid => {
+        const c = allNodes.get(cid);
+        // Seed position near parent so bubbles pop out from it
+        c.x = (node.x ?? 0) + (Math.random() - 0.5) * 6;
+        c.y = (node.y ?? 0) + (Math.random() - 0.5) * 6;
+        c.vx = c.vy = 0;
+        if (!simNodes.includes(c)) simNodes.push(c);
+        const lk = allLinks.get(node.id + '~' + cid);
+        if (lk && !simLinks.includes(lk)) simLinks.push(lk);
+      });
+      restartSim();
+      render();
+    }
+
+    function collapse(node) {
+      node.isExpanded = false;
+      removeDesc(node);
+      restartSim();
+      render();
+    }
+
+    function removeDesc(node) {
+      node.children.forEach(cid => {
+        const c = allNodes.get(cid);
+        if (c.isExpanded) removeDesc(c);
+        c.isExpanded = false;
+        const ni = simNodes.indexOf(c);
+        if (ni !== -1) simNodes.splice(ni, 1);
+        const lk = allLinks.get(node.id + '~' + cid);
+        if (lk) { const li = simLinks.indexOf(lk); if (li !== -1) simLinks.splice(li, 1); }
+      });
+    }
+
+    // ── Legend ────────────────────────────────────────────────────────────────
+    function buildLegend() {
+      const leg = d3.select('#legend');
+      SEC_NAMES.forEach((name, i) => {
+        const item = leg.append('div').attr('class', 'legend-item');
+        item.append('div').attr('class', 'legend-dot').style('background', COLORS[i]);
+        item.append('span').text(name);
+      });
+    }
+
+    // ── Gentle drift: keep the canvas feeling alive ───────────────────────────
+    function startDrift() {
+      setInterval(() => {
+        if (simulation.alpha() < 0.004) simulation.alpha(0.012).restart();
+      }, 4500);
+    }
+
+    // ── Main ─────────────────────────────────────────────────────────────────
+    async function main() {
+      const resp = await fetch('./CS.md?v=' + Date.now());
+      if (!resp.ok) throw new Error('HTTP ' + resp.status + ' al cargar CS.md');
+      const md = await resp.text();
+
+      // Parse markdown into node/link registries
+      parse(md);
+
+      // Bootstrap sim with only root + H2 nodes visible
+      const root = allNodes.get(rootId);
+      simNodes = [root];
+      root.children.forEach(cid => {
+        simNodes.push(allNodes.get(cid));
+        simLinks.push(allLinks.get(rootId + '~' + cid));
+      });
+
+      // Pin root at center; pre-position H2 in a ring to avoid random explosion
+      root.fx = 0; root.fy = 0; root.x = 0; root.y = 0;
+      const h2s    = root.children.map(id => allNodes.get(id));
+      const orbit  = 190;
+      h2s.forEach((n, i) => {
+        const angle = (2 * Math.PI * i / h2s.length) - Math.PI / 2;
+        n.x = Math.cos(angle) * orbit;
+        n.y = Math.sin(angle) * orbit;
+      });
+
+      buildSim();
+      render();
+      buildLegend();
+
+      // Start drift after initial layout settles
+      setTimeout(startDrift, 7000);
+    }
+
+    main().catch(err => {
+      svg.append('text')
+        .attr('x', W / 2).attr('y', H / 2 - 10)
+        .attr('text-anchor', 'middle')
+        .attr('fill', '#E07B54')
+        .attr('font-size', '15px')
+        .attr('font-family', 'monospace')
+        .text('⚠ ' + err.message);
+      svg.append('text')
+        .attr('x', W / 2).attr('y', H / 2 + 18)
+        .attr('text-anchor', 'middle')
+        .attr('fill', 'rgba(255,255,255,0.4)')
+        .attr('font-size', '12px')
+        .text('Usa  npx serve .  para desarrollo local');
+    });
+  })();
+  </script>
+</body>
+</html>

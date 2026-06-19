@@ -129,8 +129,8 @@
   <script>
   (() => {
     // ── Config ────────────────────────────────────────────────────────────────
-    const COLORS     = ['#4F86C6', '#E07B54', '#5BAD72', '#A06BC0'];
-    const SEC_NAMES  = ['Arquitectura', 'Bases de Datos', 'Vue.js', '.NET / C#'];
+    const COLORS     = ['#4F86C6', '#E07B54', '#5BAD72', '#A06BC0', '#26B5A0'];
+    const SEC_NAMES  = ['Arquitectura', 'Bases de Datos', 'Vue.js', '.NET / C#', 'IA en Dev'];
 
     // Visual sizes per depth (0=root, 1=H2, 2=H3, 3=bullet, 4=sub-bullet)
     const RADII    = [72, 52, 38, 24, 16];
@@ -186,29 +186,30 @@
         if (d.id !== rootId) { d.fx = null; d.fy = null; }
       });
 
-    // ── Markdown Parser ───────────────────────────────────────────────────────
-    function parse(md) {
-      let counter = 0;
+    // ── Shared node/link factory (used by all parsers) ───────────────────────
+    let nodeCounter = 0;
 
-      function node(label, depth, parentId, sec) {
-        const id = 'n' + counter++;
-        const n = {
-          id, label, depth, parentId,
-          sectionIndex: sec,
-          children: [],
-          isExpanded: false,
-          r: RADII[Math.min(depth, 4)],
-          _moved: false,
-        };
-        allNodes.set(id, n);
-        if (parentId != null) {
-          allNodes.get(parentId).children.push(id);
-          const k = parentId + '~' + id;
-          allLinks.set(k, { id: k, source: parentId, target: id, depth });
-        }
-        return id;
+    function node(label, depth, parentId, sec) {
+      const id = 'n' + nodeCounter++;
+      const n = {
+        id, label, depth, parentId,
+        sectionIndex: sec,
+        children: [],
+        isExpanded: false,
+        r: RADII[Math.min(depth, 4)],
+        _moved: false,
+      };
+      allNodes.set(id, n);
+      if (parentId != null) {
+        allNodes.get(parentId).children.push(id);
+        const k = parentId + '~' + id;
+        allLinks.set(k, { id: k, source: parentId, target: id, depth });
       }
+      return id;
+    }
 
+    // ── CS.md parser ─────────────────────────────────────────────────────────
+    function parse(md) {
       rootId = node('CS Apuntes', 0, null, -1);
       let h2Id = null, h3Id = null, lastB0Id = null, sec = -1;
 
@@ -241,6 +242,60 @@
           lastB0Id = node(lbl, 3, h3Id ?? h2Id ?? rootId, sec);
         } else {
           node(lbl, 4, lastB0Id ?? h3Id ?? h2Id ?? rootId, sec);
+        }
+      }
+    }
+
+    // ── IA.md parser ─────────────────────────────────────────────────────────
+    // Handles: numbered lists (0 and 4-space indent), dash bullets (- and  -),
+    // ## headings, and implicit section headers (lines ending with ":")
+    function parseIA(md) {
+      const sec    = 4;
+      const iaRoot = node('IA en Dev', 1, rootId, sec);
+      let section  = iaRoot;  // current depth-2 bucket
+      let b0       = null;    // current depth-3 node
+      let b1       = null;    // current depth-4 node (for deeper nesting)
+
+      for (const raw of md.split('\n')) {
+        const t = raw.trim();
+        if (!t) continue;
+
+        // ## Heading → depth-2 section
+        const hm = t.match(/^## (.*)/);
+        if (hm) {
+          section = node(clean(hm[1]), 2, iaRoot, sec);
+          b0 = b1 = null; continue;
+        }
+
+        // Non-indented line ending with ":" → implicit depth-2 section
+        if (!raw.match(/^\s/) && t.endsWith(':') && !t.match(/^\d/)) {
+          section = node(clean(t.replace(/:$/, '')), 2, iaRoot, sec);
+          b0 = b1 = null; continue;
+        }
+
+        // Numbered items at any indent level
+        const nm = raw.match(/^( *)\d+\. (.*)/);
+        if (nm) {
+          const lbl = clean(nm[2]);
+          if (nm[1].length <= 3) {
+            b0 = node(lbl, 3, section, sec); b1 = null;
+          } else {
+            b1 = node(lbl, 4, b0 ?? section, sec);
+          }
+          continue;
+        }
+
+        // Dash bullets: - (0), sub (4+), deep (8+)
+        const dm = raw.match(/^( *)- (.*)/);
+        if (!dm) continue;
+        const lbl = clean(dm[2]);
+        const ind = dm[1].length;
+        if (ind === 0) {
+          b0 = node(lbl, 3, section, sec); b1 = null;
+        } else if (ind <= 5) {
+          b1 = node(lbl, 4, b0 ?? section, sec);
+        } else {
+          node(lbl, 4, b1 ?? b0 ?? section, sec);
         }
       }
     }
@@ -521,12 +576,15 @@
 
     // ── Main ─────────────────────────────────────────────────────────────────
     async function main() {
-      const resp = await fetch('./CS.md?v=' + Date.now());
-      if (!resp.ok) throw new Error('HTTP ' + resp.status + ' al cargar CS.md');
-      const md = await resp.text();
+      const v = Date.now();
+      const [csMd, iaMd] = await Promise.all([
+        fetch('./CS.md?v=' + v).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status + ' – CS.md'); return r.text(); }),
+        fetch('./IA.md?v=' + v).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status + ' – IA.md'); return r.text(); }),
+      ]);
 
-      // Parse markdown into node/link registries
-      parse(md);
+      // Parse both files into the shared node/link registry
+      parse(csMd);
+      parseIA(iaMd);
 
       // Bootstrap sim with only root + H2 nodes visible
       const root = allNodes.get(rootId);
